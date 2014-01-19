@@ -1,0 +1,88 @@
+#!/bin/sh
+# Fastd-register script for mesh-vpn interface
+# Uses md5sum of the pubkey to create anonymized hostnames
+# By CyrusFox
+
+fail() {
+    echo "$1" 1>&2
+    exit 1
+}
+
+printArgs () {
+    fail "
+    Registration script for fastd mesh-vpn service
+Usage:
+$0 register
+"
+}
+
+generate_keys() {
+	/usr/bin/fastd --generate-key > /tmp/fastdregister/keys
+	local secret=$(cat /tmp/fastdregister/keys  | grep Secret | cut -f2 -d' ')
+	cat << EOF > /etc/fastd/mesh-vpn/secret.conf
+secret "$secret";
+EOF
+	cat /tmp/fastdregister/keys | grep Public > /etc/fastd/mesh-vpn/pubkey
+}
+
+send_request() {
+	local pubkey=$1
+	local hostname=$(echo $pubkey | md5sum | cut -f1 -d' ')
+	echo -e "POST /api/node HTTP/1.1\r
+Host: $register_server\r
+User-Agent: fastdregister\r
+Content-Type: application/x-www-form-urlencoded\r
+Content-Length: 110\r
+Accept: */*\r
+Connection: close\r
+\r
+hostname=$hostname&key=$pubkey\r
+\r
+" | netcat -v -w 1 $register_server 80 > /tmp/fastdregister/answer
+	local answer=$(cat /tmp/fastdregister/answer) 
+	echo $answer
+}
+
+enable_fastd() {
+	local fastd_enabled=$(uci -q get fastd.mesh_vpn.enabled)
+	if [ "$fastd_enabled" == "0" ]; then 
+		uci set fastd.mesh_vpn.enabled=1
+		uci commit fastd
+		/etc/init.d/fastd enable
+		echo "Fastd has been enabled, please start it using \"/etc/init.d/fastd start\" or reboot the node"
+	else
+		echo "Fastd is already enabled, please restart it using \"/etc/init.d/fastd restart\" or reboot the node"
+	fi
+}
+
+register() {
+	[ ! -f "/etc/fastd/mesh-vpn/pubkey" -a ! -f "/etc/fastd/mesh-vpn/secret.conf" ] && generate_keys
+	local pubkey=$(cat /etc/fastd/mesh-vpn/pubkey | grep Public | cut -f2 -d' ')
+	local answer=$(send_request $pubkey)
+	local status_code=$(echo $answer | head -n 1 | cut -f2 -d' ')
+	case $status_code in
+		200)
+			echo "Node registered! It may take about 5 minutes for the registration to be active on all servers"
+			enable_fastd
+		;;
+		409)
+			fail "Error! Node already registered"
+		;;
+		*)
+			fail "Error! Unrecognized status code: $status_code"
+		;;
+	esac
+}
+
+case "$1" in
+  register)
+	register_server=$(uci -q get fastdregister.settings.register_server)
+	[ -z $register_server ] && fail "Error! Register server not set in fastd register config"
+	[ -d "/tmp/fastdregister" ] || mkdir -p /tmp/fastdregister
+	rm -f /tmp/fastdregister/*
+	register
+    ;;
+  *)
+	printArgs
+    ;;
+esac
